@@ -1,0 +1,8 @@
+azure-ai-documentintelligence
+openai
+dotenv
+cohere
+chromadb
+pydantic
+pydantic_settings
+fastapi
