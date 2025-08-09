@@ -1,3 +1,14 @@
+# For chroma DB embedding function there are two options   
+#       1. use the default one
+#       2. use cohere embedding function 
+
+# Two step chunking
+# summary_embedding: embedding of the concise, situating summary (50 words). This is used for fast approximate 
+#                   retrieval from VectorDB.
+
+# content_embedding: embedding of the full chunk (or a compression of it) used for fine-grained reranking 
+
+from utils import trim_bytes, flush_section, is_table, persist_chunk, load_chunk
 from config import Settings
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 import os
@@ -11,6 +22,8 @@ import cohere
 import logging
 from tqdm import tqdm
 import chromadb
+import chromadb.utils.embedding_functions as embedding_functions
+import hashlib
 
 load_dotenv()
 
@@ -42,52 +55,101 @@ class ContextualizedRAG:
             base_url = self.endpoint
         )
 
-        self.cohere_client = cohere.ClientV2(
+        self.cohere_client = cohere.Client(
             api_key=settings.cohere.api_key,
-            base_url=settings.cohere.base_url,
-            client_name=settings.cohere.client_name,
-            timeout=settings.cohere.timeout
         )
+
+        # self.cohere_client = cohere.ClientV2(
+        #     api_key=settings.cohere.api_key,
+        #     base_url=settings.cohere.base_url,
+        #     client_name=settings.cohere.client_name,
+        #     timeout=settings.cohere.timeout
+        # )
 
         self.doc_intel_client = DocumentIntelligenceService()
         
-        self.collection = chromadb.CloudClient(
-            api_key=settings.chromadb.api_key,
-            tenant=settings.chromadb.tenant,
-            database=settings.chromadb.database
+        # Local store for full chunks (avoids Chroma size quotas)
+        self.store_dir = os.path.join(os.path.dirname(__file__), ".rag_store")
+        os.makedirs(self.store_dir, exist_ok=True)
+
+        # chroma client
+        client = chromadb.HttpClient(
+        ssl=True,
+        host='api.trychroma.com',
+        tenant=settings.chromadb.tenant,
+        database=settings.chromadb.database,
+        headers={
+            'x-chroma-token': settings.chromadb.token
+        }
         )
+
+        self.collection = client.get_or_create_collection(name="hackrx-sections")
+
+    def _markdown_to_chunks(self, markdown_content: str, base_doc_id: str) -> List[Dict[str, Any]]:
+        """
+        Produce structured chunks
+        """
+
+        lines = markdown_content.splitlines()
+        sections: List[Dict[str, str]] = []
+        current_heading = None
+        buffer: List[str] = []
+
+        # Parse top-level sections by markdown headings (#, ##, ###)
+        for ln in lines:
+            m = re.match(r'^(#{1,6})\s+(.*)$', ln)
+            if m:
+                # Flush previous section
+                sections, buffer = flush_section(sections, current_heading, buffer)
+                # Start new section
+                current_heading = m.group(2).strip()
+            else:
+                buffer.append(ln)
+
+        # Flush last section
+        sections, buffer = flush_section(sections, current_heading, buffer)
+
+        chunks: List[Dict[str, Any]] = []
+        sec_idx = 0
+        for sec in sections:
+            heading = sec["heading"] or "Untitled Section"
+            sec_idx += 1
+            parts = [p for p in re.split(r'\n\s*\n', sec.get("text", "")) if p and p.strip()]
+            part_idx = 0
+            for part in parts:
+                txt = part.strip()
+                if not txt:
+                    continue
+                part_idx += 1
+                level = "table" if is_table(txt) else "paragraph"
+                chunk_id = f"{base_doc_id}#sec{sec_idx}#part{part_idx}"
+                chunks.append({
+                    "doc_id": base_doc_id,
+                    "chunk_id": chunk_id,
+                    "title": heading,
+                    "section_heading": heading,
+                    "chunk_text": txt,
+                    "chunk_summary": "",
+                    "chunk_level": level,
+                })
+        return chunks
 
     def structural_chunking_from_pdf(self, pdf_blob_url) -> List[Dict[str, Any]]:
         """
         Uses Microsoft Document Intelligence to perform section-wise chunking.
-        Works if the source is in Markdown Format
+        Returns structured chunks according to the required schema.
         """
-
         logging.info(f"Analyzing document from URL: {pdf_blob_url}")
         analysis_results = self.doc_intel_client.analyze(source=pdf_blob_url)
 
-        documents = []
-        doc_id_counter = 0
-
         markdown_content = analysis_results["analyzeResult"]["content"]
-        chunks = re.split(r"\n(?=#)", markdown_content)
 
-        for chunk in chunks:
-            if not chunk.strip():
-                continue
-            title = chunk.strip().split('\n')[0].strip()
+        base_doc_id = f"doc_"
 
-            doc = {
-                "doc_id": f"doc_{doc_id_counter}",
-                "title": title,
-                "chunked_content": chunk.strip(),
-            }
-            documents.append(doc)
-            doc_id_counter += 1
+        chunks = self._markdown_to_chunks(markdown_content=markdown_content, base_doc_id=base_doc_id)
 
         print("Success")
-
-        return documents, markdown_content
+        return chunks, markdown_content
     
     def generate_response(self, prompt1, prompt2, model = "gemini-2.5-flash"):
         """
@@ -124,24 +186,56 @@ class ContextualizedRAG:
         """
         Generates a summary for each chunk using the full document as context.
         """
-        
         documents, full_doc_markdown = self.structural_chunking_from_pdf(pdf_blob_url)
 
         processed_docs = []
-        prompt1 = DOCUMENT_CONTEXT_PROMPT.format(doc_content=full_doc_markdown[:20000])
-        
-        for doc in tqdm(documents, desc="Contextualizing Chunks"):
-            prompt2 = CHUNK_CONTEXT_PROMPT.format(chunk_content=doc['chunked_content'])
+        prompt1 = DOCUMENT_CONTEXT_PROMPT.format(doc_content=trim_bytes(full_doc_markdown, max_bytes=20000))
 
+        for doc in tqdm(documents, desc="Contextualizing Chunks"):
+            prompt2 = CHUNK_CONTEXT_PROMPT.format(chunk_content=doc['chunk_text'])
             summary = self.generate_response(prompt1, prompt2)
 
+            # Persist full chunk to disk and store only a key in Chroma
+            store_key = persist_chunk(doc["chunk_text"], self.store_dir)
+
             processed_docs.append({
-                "doc_id": doc["doc_id"],
+                "doc_id": doc["chunk_id"],
+                "doc_ref_id": doc["doc_id"],
+                "title": doc.get("title", ""),
+                "section_heading": doc.get("section_heading", ""),
+                "chunk_level": doc.get("chunk_level", "paragraph"),
                 "summary": summary,
-                "full_chunk_content": doc["chunked_content"] # This is the payload for final retrieval
+                "store_key": store_key,
+                "full_chunk_content": doc["chunk_text"],
             })
-        
         return processed_docs
+    
+    def _cohere_embed(self, texts: List[str], input_type: str) -> List[List[float]]:
+        """Robust wrapper for Cohere embed across SDK variants."""
+        try:
+            resp = self.cohere_client.embed(
+                model="embed-english-v3.0",
+                input_type=input_type,
+                texts=texts,
+            )
+        except Exception as e1:
+            logging.warning(f"Cohere embed v3.0 failed: {e1}. Falling back to multilingual.")
+            resp = self.cohere_client.embed(
+                model="embed-multilingual-v3.0",
+                input_type=input_type,
+                texts=texts,
+            )
+
+        # Handle different SDK return shapes
+        if hasattr(resp, "embeddings"):
+            emb = getattr(resp.embeddings, "float", None)
+            if emb is None:
+                emb = resp.embeddings  # already a List[List[float]]
+            return emb
+        # Fallback (older SDKs might use 'data' etc.)
+        if hasattr(resp, "data") and resp.data and hasattr(resp.data[0], "embedding"):
+            return [d.embedding for d in resp.data]
+        raise RuntimeError("Unexpected Cohere embed response shape")
     
     def create_and_store_embeddings(self, processed_docs: List[Dict[str, Any]]):
         """
@@ -152,23 +246,38 @@ class ContextualizedRAG:
         
         summaries_to_embed = [doc['summary'] for doc in processed_docs]
 
-        response = self.cohere_client.embed(
-            model="embed-v4.0",
-            input_type="search_document",
-            texts=summaries_to_embed,
-            embedding_types=["float"]
-        )
-
-        embeddings = response.embeddings.float
+        embeddings = self._cohere_embed(summaries_to_embed, input_type="search_document")
 
         logging.info("Storing summaries, metadata, and embeddings in ChromaDB...")
 
-        self.collection.add(
-            ids=[doc["doc_id"] for doc in processed_docs],
-            embeddings=embeddings,
-            documents=[doc["summary"] for doc in processed_docs], 
-            metadatas=[{"full_content": doc["full_chunk_content"]} for doc in processed_docs] 
-        )
+        documents_payload = [trim_bytes(doc["summary"], max_bytes=1000) for doc in processed_docs]
+
+        metadatas_payload = [{
+            "title": trim_bytes(doc.get("title", ""), max_bytes=256),
+            "section_heading": trim_bytes(doc.get("section_heading", ""), max_bytes=256),
+            "chunk_level": doc.get("chunk_level", "paragraph"),
+            "store_key": doc["store_key"],
+            "doc_id": doc.get("doc_ref_id", ""),
+        } for doc in processed_docs]
+
+        try:
+            self.collection.upsert(
+                ids=[doc["doc_id"] for doc in processed_docs],
+                embeddings=embeddings,
+                documents=documents_payload,
+                metadatas=metadatas_payload,
+            )
+        except AttributeError:
+            try:
+                self.collection.delete(ids=[doc["doc_id"] for doc in processed_docs])
+            except Exception:
+                pass
+            self.collection.add(
+                ids=[doc["doc_id"] for doc in processed_docs],
+                embeddings=embeddings,
+                documents=documents_payload,
+                metadatas=metadatas_payload,
+            )
 
         logging.info("Storage complete.")
 
@@ -187,6 +296,35 @@ class ContextualizedRAG:
             print(f"[ERROR]: {e}")
             logging.info(f"[ERROR]: {e}")
 
+    def generate_answer(self, query: str, context: str, model: str = "gemini-2.5-flash") -> str:
+        """Return a concise answer strictly based on the provided context."""
+        prompt = f"""You are an assistant answering questions about an insurance policy.\n"
+            "Answer concisely and only using the provided context. If the answer is not in the context, say: "
+            "\"I couldn't find that in the policy.\"\n\n"
+            f"Context:
+                  <content>
+                    {trim_bytes(context, max_bytes=12000)}
+                  </content>\n\n"
+            f"Question:
+                  <query>
+                        {query}
+                  </query>\n\n"
+            Answer:
+            
+            Generate only the related to the query and nothing else.
+            """
+        try:
+            resp = self.llm_client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=300,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            logging.error(f"Answer generation failed: {e}")
+            return "I couldn't generate an answer at this time."
+    
     def agentic_retrieval_workflow(self, query: str, top_n: int = 5) -> str:
         """
         Orchestrates the full two-stage RAG process:
@@ -196,46 +334,46 @@ class ContextualizedRAG:
         4. Retrieves the full content for the top results.
         """
         
-        query_embedding_response = self.cohere_client.embed(
-            model="embed-v4.0",
-            input_type="search_document",
-            texts=[query],
-            embedding_types=["float"]
-        )
+        q_emb = self._cohere_embed([query], input_type="search_query")[0]
 
-        query_embedding = query_embedding_response.embeddings.float
-
-        # 2. Vector Search on Summaries
         retrieved_results = self.collection.query(
-            query_embeddings=[query_embedding],
-            n_results=top_n * 3, # Retrieve more results initially for the reranker
+            query_embeddings=[q_emb],
+            n_results=top_n * 3,
             include=["documents", "metadatas"]
         )
-        
-        # The 'documents' field now contains the summaries
-        docs_for_reranking = retrieved_results['documents'][0]
 
-        # 3. Rerank the Summaries for Relevance
+        docs_for_reranking = retrieved_results.get('documents', [[]])[0]
+        metas = retrieved_results.get('metadatas', [[]])[0]
+
+        if not docs_for_reranking:
+            return "No relevant context found."
+
         logging.info(f"Reranking the top {len(docs_for_reranking)} summaries.")
-        reranked_results = self.cohere_client.rerank(
-            model="rerank-v3.5",
-            query=query,
-            documents=docs_for_reranking,
-            top_n=top_n
-        )
+        try:
+            reranked_results = self.cohere_client.rerank(
+                model="rerank-english-v3.0",
+                query=query,
+                documents=docs_for_reranking,
+                top_n=min(top_n, len(docs_for_reranking))
+            )
+            top_indices = [r.index for r in reranked_results.results]
+        except Exception as e:
+            logging.warning(f"Rerank failed: {e}. Using initial order.")
+            top_indices = list(range(min(top_n, len(docs_for_reranking))))
 
         final_context_chunks = []
-        for result in reranked_results.results:
-            # The reranker gives us back the index of the document in the original list
-            original_index = result.index
-            # Use this index to get the corresponding metadata with the full content
-            full_content = retrieved_results['metadatas'][0][original_index]['full_content']
+        for idx in top_indices:
+            store_key = metas[idx].get("store_key")
+            if store_key:
+                full_content = load_chunk(store_key, self.store_dir)
+            else:
+                full_content = metas[idx].get("full_content", "")
             final_context_chunks.append(full_content)
 
         logging.info(f"Retrieved {len(final_context_chunks)} final chunks for context.")
-        return "\n\n---\n\n".join(final_context_chunks)
-
-
+        
+        context = "\n\n---\n\n".join(final_context_chunks)
+        return self.generate_answer(query=query, context=context)
 
 pdf_blob_url = "https://hackrx.blob.core.windows.net/assets/policy.pdf?sv=2023-01-03&st=2025-07-04T09%3A11%3A24Z&se=2027-07-05T09%3A11%3A00Z&sr=b&sp=r&sig=N4a9OU0w0QXO6AOIBiu4bpl7AXvEZogeT%2FjUHNO7HzQ%3D"
 response = requests.get(pdf_blob_url)
@@ -258,6 +396,8 @@ questions = [
 c = ContextualizedRAG()
 c.data_ingestion(pdf_blob_url=pdf_blob_url)
 answers = []
-c.agentic_retrieval_workflow(query=questions[0])
-# for q in questions:
-#     answers.append(c.agentic_retrieval_workflow(query=q))
+ans = c.agentic_retrieval_workflow(query=questions[0])
+
+
+for q in questions:
+    answers.append(c.agentic_retrieval_workflow(query=q))

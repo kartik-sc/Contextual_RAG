@@ -30,6 +30,7 @@ class ChromaDbSettings(BaseSettings):
     api_key: str = os.getenv("CHROMA_API_KEY")
     tenant: str = os.getenv("CHROMA_TENANT")
     database: str = os.getenv("CHROMA_DATABASE")
+    token: str = os.getenv("CHROMA_TOKEN")
 
 class Settings(BaseSettings):
     document_intelligence: DocumentIntelligenceSettings = DocumentIntelligenceSettings()

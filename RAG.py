@@ -56,14 +56,21 @@ class DocumentIntelligenceService:
             requests.HTTPError: If the API request fails.
         """
         url = f"{self.endpoint}/documentintelligence/documentModels/{model_id}:analyze?api-version={self.api_version}&outputContentFormat=markdown"
-        headers = {
-            "Content-Type": "application/json",
-            "Ocp-Apim-Subscription-Key": self.key,
-        }
-        data = {"urlSource": source} if is_url else {"base64Source": source}
-
-        logging.info("Submitting document for analysis")
-        response = requests.post(url, headers=headers, json=data)
+        
+        if is_url:
+            headers = {
+                "Content-Type": "application/json",
+                "Ocp-Apim-Subscription-Key": self.key,
+            }
+            data = {"urlSource": source}
+            response = requests.post(url, headers=headers, json=data)
+        else:
+            headers = {
+                "Content-Type": "application/octet-stream",
+                "Ocp-Apim-Subscription-Key": self.key,
+            }
+            response = requests.post(url, headers=headers, data=source)
+        
         response.raise_for_status()
 
         operation_location = response.headers.get("Operation-Location")

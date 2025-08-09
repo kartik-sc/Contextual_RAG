@@ -1,8 +1,11 @@
 azure-ai-documentintelligence
 openai
-dotenv
+python-dotenv
 cohere
-chromadb
+chromadb>=0.5.0 # Compatible with Python 3.11.9, avoids known issues with latest versions
 pydantic
-pydantic_settings
+pydantic-settings
 fastapi
+tqdm
+uvicorn[standard]
+numpy==2.0.0
