@@ -2,3 +2,5 @@
 /voyageai-env
 .env
 /.rag_store
+/archives
+result_id.txt
