@@ -1,72 +1,22 @@
+# Small Test:- In the reason query function I have specifically specified response format
+#              but not in search_query generating function
+
 from config import Settings
 from chunker import TableAwareChunker
-from state import QueryPlan, ReasoningQueryPlan
+from state import ReasoningQueryPlan, SearchQueryPlan, InputState, OutputState, OverallState
 from extract import DocumentIntelligenceService
+from prompts import SEARCH_QUERY_PROMPT, PLANNER_PROMPT, FEW_SHOT_EXAMPLES, GENERATOR_PROMPT
 
 from dotenv import load_dotenv
-from typing import List,Dict,Any
-import requests
-import re
+from typing import List,Dict,Any,Union
 import openai
 import cohere
 import logging
 import chromadb
+from langgraph.types import interrupt, Command
+from langchain.output_parsers import PydanticOutputParser
 
 load_dotenv()
-
-DOCUMENT_CONTEXT_PROMPT = """
-<document>
-{doc_content}
-</document>
-"""
-
-CHUNK_CONTEXT_PROMPT = """
-Here is the chunk we want to situate within the whole document
-<chunk>
-{chunk_content}
-</chunk>
-
-Please give a short succinct context (maximum of 50 words) to situate this chunk within the overall document for the purposes of improving search retrieval of the chunk.
-Answer only with the succinct context and NOTHING ELSE.
-"""
-
-FEW_SHOT_EXAMPLES = [
-    {
-        "user_query": "I want to reimburse my insurance amount for liver treatment.",
-        "reasoning_queries": """- Is this treatment related to alcohol consumption?
-- What specific medical procedures were performed?
-- Was the treatment received at an in-network or out-of-network hospital?""",
-        "search_queries": """- policy exclusions for alcohol-related liver conditions
-- coverage details for liver surgery and related treatments
-- reimbursement rules for in-network vs out-of-network hospitals
-- waiting period for organ-related critical illnesses
-- documents required for submitting a major medical claim"""
-    },
-    {
-        "user_query": "I am pregnant and want to know about coverage for delivery.",
-        "reasoning_queries": """- How long have you had this insurance policy?
-- Is this a routine pregnancy or are there complications?
-- Do you plan to use a hospital that is part of the insurance network?""",
-        "search_queries": """- maternity and childbirth benefits coverage
-- waiting period for pregnancy-related claims
-- coverage limits for normal delivery vs. caesarean section
-- in-network hospitals and clinics for maternity care
-- coverage for newborn baby care and post-natal checkups"""
-    },
-    {
-        "user_query": "I had a bike accident and broke my arm. What do I do?",
-        "reasoning_queries": """- Was the treatment performed in an emergency room?
-- Does the policy have any exclusions for injuries from hazardous activities or sports?
-- Will follow-up care like physiotherapy be required?""",
-        "search_queries": """- accidental injury and emergency medical coverage
-- policy exclusions related to adventure sports or hazardous activities
-- coverage for post-accident rehabilitation and physiotherapy
-- procedure for filing an accident insurance claim
-- list of documents required for accident reimbursement"""
-    }
-]
-
-
 class ContextualizedRAG:
     def __init__(self, collection_name: str = None):
         
@@ -101,6 +51,7 @@ class ContextualizedRAG:
         self.chunker_class = TableAwareChunker(child_chunk_size = 512)
 
         self.child_chunks = []
+        self.parent_chunks = []
 
     def _extract_content(self, pdf_blob_url):
         """
@@ -111,8 +62,9 @@ class ContextualizedRAG:
         analysis_result = self.doc_intel_client.analyze(pdf_blob_url, True)
         markdown_content = analysis_result["analyzeResult"]["content"]
 
-        parent_chunks, child_chunks = self.chunker_class.process_document(markdown_content) 
+        child_chunks, parent_chunks = self.chunker_class.process_document(markdown_content) 
         self.child_chunks = child_chunks
+        self.parent_chunks = parent_chunks
 
         return parent_chunks, child_chunks
     
@@ -121,7 +73,7 @@ class ContextualizedRAG:
         Generates embeddings for the summaries using Cohere and stores them in ChromaDB.
         """
 
-        print(f"Generating Vector embeddings for {len(processed_docs)} summaries...")
+        logging.info(f"Generating Vector embeddings for {len(processed_docs)} summaries...")
         content_to_embed = [ele['content'] for ele in processed_docs]
 
         try:
@@ -129,15 +81,17 @@ class ContextualizedRAG:
                 model="embed-english-v3.0",
                 input_type="search_document",
                 texts=content_to_embed,
+                embedding_types=["float"]
             )
         except Exception as e:
             resp = self.cohere_client.embed(
                 model="embed-multilingual-v3.0",
                 input_type="search_document",
                 texts=content_to_embed,
+                embedding_types=["float"]
             )
 
-        embeddings = resp.embeddings.float_
+        embeddings = resp.embeddings.float
 
         self.collection.add(
             ids=[doc["child_id"] for doc in processed_docs],
@@ -148,33 +102,48 @@ class ContextualizedRAG:
 
         logging.info("Storage complete.")
 
-    def data_ingestion(self, pdf_blob_url):
+    def data_ingestion(self, state:InputState):
         """
         This function completes the data ingestion into the vector database
         """
         logging.info("DATA ingestion starts")
+        pdf_blob_url = state.pdf_blob_url
 
         try:
             _, processed_docs = self._extract_content(pdf_blob_url=pdf_blob_url)
             self._create_and_store_embeddings(processed_docs)
+            return {"pdf_blob_url" : state.pdf_blob_url}
 
         except Exception as e:
             print(f"[ERROR]: {e}")
+
+    def get_parse_user_query(self, state:InputState):
+        """
+        Accepts query from user
+        """
+        user_query = state.user_query
+
+        if user_query == "":
+            user_query = input("Enter your query")
+
+        plan: ReasoningQueryPlan = self._query_parser(user_query)
+        fields = ReasoningQueryPlan.model_fields.keys()
+
+        result = {}
+        for field in fields:
+            result[field] = getattr(plan, field)
+
+        return result        
 
     def _query_parser(self, user_query:str):
         """
         Parses the question and generates a few reasoning and clarification
         query.
         """
-        
-        PLANNER_PROMPT = f"""
-        You are an expert insurance claims analyst. Your task is to deconstruct a user's query 
-        into a logical plan for investigation.
 
-        Generate "Reasoning Queries". These are clarifying questions a human analyst would 
-        need to ask the user to gather all necessary information. They should probe for potential 
-        policy exclusions, waiting periods, and network status.
-        """
+        parser = PydanticOutputParser(pydantic_object=ReasoningQueryPlan)
+
+        planner_prompt = PLANNER_PROMPT
         
         formatted_examples = ""
         for i in range(1,len(FEW_SHOT_EXAMPLES)):
@@ -190,14 +159,15 @@ class ContextualizedRAG:
             ==============================
             """
 
-        prompt1 = PLANNER_PROMPT + formatted_examples
+        prompt1 = planner_prompt + formatted_examples
+        human_message = f"{user_query}\nFormat Instruction:\n{parser.get_format_instructions()}"
 
         try:
             response = self.llm_client.beta.chat.completions.parse(
                 model="gemini-2.5-flash",
                 messages=[
                     {'role':'system', 'content':prompt1},
-                    {'role':'user', 'content': user_query}
+                    {'role':'user', 'content': human_message}
                 ],
                 response_format=ReasoningQueryPlan
             )
@@ -207,30 +177,92 @@ class ContextualizedRAG:
         except Exception as e:
             print("Planning failed")
 
-    def _retrieve_and_grade(self, search_queries):
+    def _human_in_loop(self, state):
+        plan = SearchQueryPlan(**state)
+        questions = plan.reasoning_sub_questions
+
+        answers = []
+        for q in questions:
+            # Interrupt graph execution and ask for a human response to each question
+            answer = interrupt(f"Human review required: {q} (Please provide an answer)")
+            answers.append(answer)
+        return {"reasoning_responses": answers}
+
+    def _generate_search_queries(self, state):
+        """
+        Generates search queries which is used for retrieving info from the vectorDB
+        """
+        parser = PydanticOutputParser(pydantic_object=SearchQueryPlan)
+        plan = SearchQueryPlan(**state)
+
+        search_query_prompt = SEARCH_QUERY_PROMPT.format(reason_queries = plan.reasoning_sub_questions, 
+                                                         user_response_to_rqs = plan.reasoning_responses
+                                                        )
+        
+        human_message = f"""Generate relevant search queries using 
+        reasoning_sub_questions and reaoning_response{plan.user_query}"""
+        
+        try:
+            response = self.llm_client.beta.chat.completions.parse(
+                model="gemini-2.5-flash",
+                messages=[
+                    {'role':'system', 'content':search_query_prompt},
+                    {'role':'user', 'content': human_message}
+                ],
+                response_format=SearchQueryPlan
+            )
+            new_plan = response.choices[0].message.parsed
+            fields = SearchQueryPlan.model_fields.keys()
+
+            result = {}
+            
+            for field in fields:
+                if field != "search_queries":
+                    result[field] = getattr(plan, field)
+                else:
+                    result[field] = new_plan.search_queries
+
+            return result
+        
+        except Exception as e:
+            print("Planning failed")
+
+    def _retrieve_and_grade(self, state):
         """
         Executes the retrieval plan, searches for child chunks,
         and returns the content of their unique parents.
         """
+        data = OverallState(**state)
+        search_queries = data["search_queries"]
+
         final_results = []
 
         query_embeddings = self.cohere_client.embed(
             texts=search_queries,
             model="embed-english-v3.0",
-            input_type="search_query"
-        ).embeddings.float_
+            input_type="search_query",
+            embedding_types=["float"]
+        )
+
+        query_embeddings = query_embeddings.embeddings.float
 
         retrieved_results = self.collection.query(
             query_embeddings=query_embeddings,
             n_results=12,
-            include=["documents","metadatas"]
+            include=["documents","metadatas"],
         )
 
         try:
-            docs_for_reranking = [ans["full_parent_content"] for ans in retrieved_results["metadatas"]]
+            docs_for_reranking = []
+            for i in len(retrieved_results["metadatas"]):
+                if retrieved_results["metadatas"][i]["content_type"] == "paragraph":
+                    docs_for_reranking.append(self.parent_chunks["parent_id"])
+                else:
+                    docs_for_reranking.append(retrieved_results["documents"][i]["content"])
+            
         except Exception as e:
             print(f"[ERROR]: {e}")
-            return final_results
+            return {"top_chunks": []}
         
         for query in search_queries:
             reranked_results = self.cohere_client.rerank(
@@ -251,43 +283,43 @@ class ContextualizedRAG:
 
         # Sort in descending order
         final_results.sort(key=lambda x:-x[0])
+        state["top_chunks"] = final_results
 
-        return final_results
+        return state
 
-    def _generate_answer(self, final_results:List, user_query:str, reasoning_ques:List[str]):
+    def _generate_answer(self, state):
         """
         Uses the content retrieved from the vector DB and writes the output
         """
 
-        generator_prompt = f"""
-            You are a meticulous insurance claims assistant. Your task is to provide a final, 
-        comprehensive answer to the user's query based ONLY on the evidence provided 
-        from the policy document. Do not invent information or make assumptions.
+        # providing the top_5 results only
+        # Changes needed for the above based on testing
+        data = OverallState(**state)
+        user_query = data["user_query"]
+        no_chunks = 0
+        final_results = []
 
-        Use the 'Reasoning Questions' as a guide to structure your analysis of the evidence. 
-        Address each point if possible and cite the information clearly.
+        for score, q, content in data["top_chunks"]:
+            if score > 0.75 and no_chunks < 5:
+                final_results.append(content)
+                no_chunks += 1
+            else:
+                break
 
-        **User's Original Query:**
-        <user_query>
-        {user_query}
-        </user_query>
+        retries = 0
 
-        **Evidence Corpus from policy document**
-        <evidence>
-        {final_results[:5]}
-        </evidence>
-
-        Provide a clear, structured, and helpful final answer.
-        """
-
-        try:
-            response = self.llm_client.chat.completions.create(
-                model="gemini-2.5-flash", # Better to use a heavy model like 2.5-pro
-                messages=[{'role':'user', 'content': generator_prompt}],
-                temperature=0.25, 
-            )
-            return response.choices[0].message.content
-        
-        except Exception as e:
-            print(f"[ERROR]: {e}")
-            return "An error occurred while generating the final answer."
+        while retries < 2:
+            generator_prompt = GENERATOR_PROMPT.format(user_query = user_query, final_results = final_results)
+            retries += 1
+            
+            try:
+                response = self.llm_client.chat.completions.create(
+                    model="gemini-2.5-pro", # Better to use a heavy model like 2.5-pro
+                    messages=[{'role':'user', 'content': generator_prompt}],
+                    temperature=0.25, 
+                )
+                return {"final_response":response.choices[0].message.content}
+            
+            except Exception as e:
+                print(f"[ERROR]: {e}")
+                return {"final_response":"An error occurred while generating the final answer."}

@@ -3,127 +3,137 @@
 import re
 import logging
 from typing import List, Dict, Any, Tuple
+from bs4 import BeautifulSoup  
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class TableAwareChunker:
     """
-    A class to perform intelligent, two-level chunking on document analysis results.
-    It creates "Parent Chunks" based on Level 1 (#) and Level 2 (##) Markdown headers
-    and smaller, table-aware "Child Chunks" for precise vector searching.
+    A class to perform intelligent chunking, now with the ability to parse
+    embedded HTML tables and convert them to clean Markdown.
     """
 
-    def __init__(self, child_chunk_size: int = 1024):
-        self.chunk_size = child_chunk_size
+    def __init__(self, child_chunk_size: int = 1024, max_parent_size: int = 4000):
+        self.child_chunk_size = child_chunk_size
+        self.max_parent_size = max_parent_size
 
-    def process_document(self, analysis_result: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-            
-        markdown_content = analysis_result
-        parent_chunks = self._create_parent_chunks(markdown_content)
-        child_chunks = self._create_table_aware_child_chunks(parent_chunks)
-        
-        return parent_chunks, child_chunks
+    def process_document(self, markdown_content: str) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+        initial_parents = self._create_initial_parent_chunks(markdown_content)
+        final_parents = self._split_oversized_parents(initial_parents)
+        parent_content_store = {p['parent_id']: p['content'] for p in final_parents}
+        child_chunks = self._create_table_aware_child_chunks(final_parents)
+        return child_chunks, parent_content_store
+    
+    
+    def _clean_content(self, text: str) -> str:
+        text = re.sub(r'<!-- .*? -->\n?', '', text)
+        text = re.sub(r'^\s*#{1,4}\s+', '', text, flags=re.MULTILINE)
+        return text.strip()
 
-    def _create_parent_chunks(self, markdown_content: str) -> List[Dict[str, Any]]:
-        """
-        Creates large, logical Parent Chunks by splitting the document by
-        both Level 1 (#) and Level 2 (##) section headers.
-        """
-        logging.info("Creating Parent Chunks based on Markdown headers (# and ##)...")
+    def _create_initial_parent_chunks(self, markdown_content: str) -> List[Dict[str, Any]]:
         parent_chunks = []
-        doc_id_counter = 0
-        
-        chunks = re.split(r"\n(?=#{1,2}\s)", markdown_content)
-
-        for chunk in chunks:
+        chunks = re.split(r"\n(?=#{1,4}\s)", markdown_content)
+        for i, chunk in enumerate(chunks):
             chunk = chunk.strip()
-            if not chunk:
-                continue
-            
-            parent_chunks.append({
-                "parent_id": f"pt_{doc_id_counter}",
-                "title": chunk.split('\n')[0].strip(),
-                "content": chunk,
-            })
-            doc_id_counter += 1
-        
-        logging.info(f"Successfully created {len(parent_chunks)} Parent Chunks.")
+            if not chunk: continue
+            parent_chunks.append({"parent_id": f"pt_{i}", "title": chunk.split('\n')[0].strip(), "raw_content": chunk})
         return parent_chunks
 
+    def _split_oversized_parents(self, parent_chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        final_parents = []
+        sub_chunk_counter = 0
+        for parent in parent_chunks:
+            cleaned_content = self._clean_content(parent['raw_content'])
+            if len(cleaned_content.encode('utf-8')) <= self.max_parent_size:
+                parent['content'] = cleaned_content
+                final_parents.append(parent)
+            else:
+                logging.warning(f"Parent {parent['parent_id']} is oversized. Splitting...")
+                paragraphs = cleaned_content.split('\n\n')
+                current_sub_chunk = ""
+                for para in paragraphs:
+                    if len((current_sub_chunk + para).encode('utf-8')) > self.max_parent_size and current_sub_chunk:
+                        sub_parent_id = f"{parent['parent_id']}_sub_{sub_chunk_counter}"
+                        final_parents.append({"parent_id": sub_parent_id, "title": f"{parent['title']} (Part {sub_chunk_counter + 1})", "content": current_sub_chunk.strip()})
+                        sub_chunk_counter += 1
+                        current_sub_chunk = ""
+                    current_sub_chunk += para + "\n\n"
+                if current_sub_chunk.strip():
+                    sub_parent_id = f"{parent['parent_id']}_sub_{sub_chunk_counter}"
+                    final_parents.append({"parent_id": sub_parent_id, "title": f"{parent['title']} (Part {sub_chunk_counter + 1})", "content": current_sub_chunk.strip()})
+                    sub_chunk_counter += 1
+        return final_parents
+
+    def _create_child_dict(self, child_id: int, content: str, parent_chunk: Dict[str, Any], content_type: str) -> Dict[str, Any]:
+        return {"child_id": f"{parent_chunk['parent_id']}_ch_{child_id}", "content": content.strip(), "metadata": {"parent_id": parent_chunk['parent_id'], "parent_title": parent_chunk['title'], "content_type": content_type}}
+
+    
     def _create_table_aware_child_chunks(self, parent_chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Creates smaller Child Chunks from Parent Chunks, ensuring tables are never split.
-        This method requires no changes, as it correctly processes the more granular parent chunks.
+        Creates smaller Child Chunks, now detecting and converting HTML tables.
         """
-        logging.info("Creating table-aware Child Chunks...")
         all_child_chunks = []
         child_id_counter = 0
 
         for parent in parent_chunks:
             blocks = parent['content'].split('\n\n')
             current_chunk_content = ""
+            current_chunk_type = 'paragraph'
 
             for block in blocks:
                 block = block.strip()
-                if not block:
-                    continue
-                is_table = block.startswith('|') and block.endswith('|')
+                if not block: continue
+                
+                is_html_table = block.startswith('<table>')
 
-                if len(current_chunk_content) + len(block) > self.chunk_size and current_chunk_content:
-                    all_child_chunks.append(self._create_child_dict(child_id_counter, current_chunk_content, parent))
+                if is_html_table:
+                    block = self._convert_html_table_to_markdown(block)
+                    current_chunk_type = 'table'
+
+                if len(current_chunk_content.encode('utf-8')) + len(block.encode('utf-8')) > self.child_chunk_size and current_chunk_content:
+                    all_child_chunks.append(self._create_child_dict(child_id_counter, current_chunk_content, parent, current_chunk_type))
                     child_id_counter += 1
                     current_chunk_content = ""
+                    current_chunk_type = 'paragraph'
 
                 current_chunk_content += block + "\n\n"
 
-                if is_table:
-                    all_child_chunks.append(self._create_child_dict(child_id_counter, current_chunk_content, parent))
+                if is_html_table:
+                    all_child_chunks.append(self._create_child_dict(child_id_counter, current_chunk_content, parent, current_chunk_type))
                     child_id_counter += 1
                     current_chunk_content = ""
+                    current_chunk_type = 'paragraph'
 
             if current_chunk_content.strip():
-                all_child_chunks.append(self._create_child_dict(child_id_counter, current_chunk_content, parent))
+                all_child_chunks.append(self._create_child_dict(child_id_counter, current_chunk_content, parent, current_chunk_type))
                 child_id_counter += 1
         
-        logging.info(f"Successfully created {len(all_child_chunks)} table-aware Child Chunks.")
         return all_child_chunks
-
-    def _create_child_dict(self, child_id: int, content: str, parent_chunk: Dict[str, Any]) -> Dict[str, Any]:
-        """Helper to create a formatted child chunk dictionary."""
-        return {
-            "child_id": f"{parent_chunk['parent_id']}_ch_{child_id}",
-            "content": content.strip(),
-            "metadata": {
-                "parent_id": parent_chunk['parent_id'],
-                "parent_title": parent_chunk['title'],
-                "full_parent_content": parent_chunk['content']
-            }
-        }
     
+    def _convert_html_table_to_markdown(self, html_content: str) -> str:
+        """
+        Parses an HTML table string and converts it into a clean Markdown table.
+        """
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            table = soup.find('table')
+            if not table:
+                return html_content 
 
-    
-MOCK_TABLE_SMALL = "| Header 1 | Header 2 |\n|---|---|\n| Row 1 A | Row 1 B |".strip()
+            markdown_rows = []
+            
+            
+            for row in table.find_all('tr'):
+                cells = [cell.get_text(strip=True) for cell in row.find_all(['td', 'th'])]
+                if cells:
+                    markdown_rows.append("| " + " | ".join(cells) + " |")
 
-MOCK_MARKDOWN_CONTENT_WITH_SUBSECTIONS = f"""
-# Section 1: Introduction
+            if len(markdown_rows) > 1 and "| ---" not in markdown_rows[1]:
+                header_cell_count = markdown_rows[0].count('|') - 1
+                divider = "| " + " | ".join(['---'] * header_cell_count) + " |"
+                markdown_rows.insert(1, divider)
 
-This is the general introduction text, belonging directly to Section 1.
-
-## Sub-section 1.1: Scope
-
-This is the text for the scope sub-section. It should be its own parent chunk.
-
-{MOCK_TABLE_SMALL}
-
-## Sub-section 1.2: Definitions
-
-This is the text for the definitions sub-section, which is another parent chunk.
-
-### heading level-3
-
-This is the type of heading which has 3 hash marks
-
-# Section 2: Coverage Details
-
-This final section has no sub-sections and is its own parent chunk.
-"""
+            return "\n".join(markdown_rows)
+        except Exception as e:
+            logging.error(f"Failed to parse HTML table: {e}")
+            return html_content

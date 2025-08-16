@@ -1,6 +1,7 @@
 azure-ai-documentintelligence
 openai
 python-dotenv
+beautifulsoup4
 cohere
 chromadb>=0.5.0 # Compatible with Python 3.11.9, avoids known issues with latest versions
 pydantic
