@@ -5,6 +5,11 @@ from rank_bm25 import BM25Okapi
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 
+# BM25-related attrs
+self._bm25 = None
+self._bm25_ids = []
+self._bm25_raws = []
+
 def _simple_tokenize(self, text: str):
     # Tokenizer for BM25 to ensure case-insensitive matching
     return re.findall(r"[a-z0-9]+", text.lower())
