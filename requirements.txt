@@ -12,3 +12,4 @@ uvicorn[standard]
 numpy==2.0.0
 langchain
 langchain-community
+langsmith

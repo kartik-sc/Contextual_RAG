@@ -5,12 +5,15 @@ from langgraph.graph import StateGraph
 from langgraph.graph import END, START
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
-from IPython.display import Image, display
+from IPython.display import Image, display, Markdown
 from typing import TypedDict
+from dotenv import load_dotenv
 
 from chunker import TableAwareChunker
 from contextualRAG import ContextualizedRAG
 from state import InputState, OutputState, OverallState
+
+load_dotenv()
 
 crag = ContextualizedRAG()
 pdf_blob_url = "https://hackrx.blob.core.windows.net/assets/policy.pdf?sv=2023-01-03&st=2025-07-04T09%3A11%3A24Z&se=2027-07-05T09%3A11%3A00Z&sr=b&sp=r&sig=N4a9OU0w0QXO6AOIBiu4bpl7AXvEZogeT%2FjUHNO7HzQ%3D"
@@ -39,7 +42,7 @@ config = {"configurable": {"thread_id": str(uuid.uuid4())}}
 
 display(Image(graph.get_graph(xray=True).draw_mermaid_png()))
 
-result = graph.invoke(InputState(user_query="I have undergone a root canal dental treatment. What is the coverage in my policy"), config=config)
+result = graph.invoke(InputState(user_query="undergone a treatment for thyroid. What is the coverage in my policy"), config=config)
 print(result["__interrupt__"])  
 
 while True:

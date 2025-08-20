@@ -15,6 +15,10 @@ import logging
 import chromadb
 from langgraph.types import interrupt, Command
 from langchain.output_parsers import PydanticOutputParser
+from langsmith.wrappers import wrap_openai
+from langsmith import traceable
+import asyncio
+import aiohttp
 
 load_dotenv()
 class ContextualizedRAG:
@@ -24,10 +28,10 @@ class ContextualizedRAG:
         self.key = settings.llm.api_key
         self.endpoint = settings.llm.base_url
 
-        self.llm_client = openai.OpenAI(
+        self.llm_client = wrap_openai(openai.OpenAI(
             api_key = self.key,
             base_url = self.endpoint
-        )
+        ))
 
         self.cohere_client = cohere.Client(
             api_key=settings.cohere.api_key,
@@ -102,6 +106,7 @@ class ContextualizedRAG:
 
         logging.info("Storage complete.")
 
+    @traceable
     def data_ingestion(self, state:InputState):
         """
         This function completes the data ingestion into the vector database
@@ -117,6 +122,7 @@ class ContextualizedRAG:
         except Exception as e:
             print(f"[ERROR]: {e}")
 
+    @traceable
     def get_parse_user_query(self, state:InputState):
         """
         Accepts query from user
@@ -135,6 +141,7 @@ class ContextualizedRAG:
 
         return result        
 
+    @traceable
     def _query_parser(self, user_query:str):
         """
         Parses the question and generates a few reasoning and clarification
@@ -188,6 +195,7 @@ class ContextualizedRAG:
             answers.append(answer)
         return {"reasoning_responses": answers}
 
+    @traceable
     def _generate_search_queries(self, state):
         """
         Generates search queries which is used for retrieving info from the vectorDB
@@ -227,6 +235,7 @@ class ContextualizedRAG:
         except Exception as e:
             print("Planning failed")
 
+    @traceable
     def _retrieve_and_grade(self, state):
         """
         Executes the retrieval plan, searches for child chunks,
@@ -253,13 +262,18 @@ class ContextualizedRAG:
         )
 
         try:
-            docs_for_reranking = []
-            for i in len(retrieved_results["metadatas"]):
-                if retrieved_results["metadatas"][i]["content_type"] == "paragraph":
-                    docs_for_reranking.append(self.parent_chunks["parent_id"])
-                else:
-                    docs_for_reranking.append(retrieved_results["documents"][i]["content"])
+            # Flatten the lists of lists returned by ChromaDB
+            all_metadatas = [item for sublist in retrieved_results["metadatas"] for item in sublist]
+            all_documents = [item for sublist in retrieved_results["documents"] for item in sublist]
             
+            docs_for_reranking = []
+            for i, meta in enumerate(all_metadatas):
+                if meta.get("content_type") == "paragraph":
+                    # Assuming 'full_parent_content' is a key in your metadata
+                    docs_for_reranking.append(meta.get("full_parent_content", ""))
+                else:
+                    docs_for_reranking.append(all_documents[i])
+             
         except Exception as e:
             print(f"[ERROR]: {e}")
             return {"top_chunks": []}
@@ -272,12 +286,12 @@ class ContextualizedRAG:
                 top_n=4
             )
 
-            for result in reranked_results["results"]:
+            for result in reranked_results.results:
                 final_results.append(
                     [
-                        result["relevance_score"], 
+                        result.relevance_score, 
                         query,
-                        docs_for_reranking[result["index"]]
+                        docs_for_reranking[result.index]
                     ]
                 )
 
@@ -287,6 +301,7 @@ class ContextualizedRAG:
 
         return state
 
+    @traceable
     def _generate_answer(self, state):
         """
         Uses the content retrieved from the vector DB and writes the output
@@ -299,12 +314,18 @@ class ContextualizedRAG:
         no_chunks = 0
         final_results = []
 
+        # currently omitting the threshold factor
         for score, q, content in data["top_chunks"]:
-            if score > 0.75 and no_chunks < 5:
+            if no_chunks < 5:
                 final_results.append(content)
                 no_chunks += 1
             else:
                 break
+            # if score > 0.75 and no_chunks < 5:
+            #     final_results.append(content)
+            #     no_chunks += 1
+            # else:
+            #     break
 
         retries = 0
 
