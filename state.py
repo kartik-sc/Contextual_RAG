@@ -19,6 +19,8 @@ class SearchQueryPlan(BaseModel):
 
 class OverallState(TypedDict):
     user_query: str = Field(description="Accepts the input query from user")
+    pdf_blob_url: str
+    error: List[Union[bool, str]] = Field(description = "Checks if any error has occured during data ingestion", default=[False,"No Error"]) 
     key_concepts: List[str] = Field(description="The core terms related to the insurance, procedures, or concepts in the user's query.", default=[""])
     reasoning_sub_questions: List[str] = Field(description="These Queries are already generated just return the queries here.", default=[""])
     reasoning_responses: List[str] = Field(description="These responses are already provided by the user, just return the responses here.", default=[""])

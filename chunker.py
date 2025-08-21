@@ -17,20 +17,20 @@ class TableAwareChunker:
         self.child_chunk_size = child_chunk_size
         self.max_parent_size = max_parent_size
 
-    def process_document(self, markdown_content: str) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
-        initial_parents = self._create_initial_parent_chunks(markdown_content)
-        final_parents = self._split_oversized_parents(initial_parents)
+    async def process_document(self, markdown_content: str) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+        initial_parents = await self._create_initial_parent_chunks(markdown_content)
+        final_parents = await self._split_oversized_parents(initial_parents)
         parent_content_store = {p['parent_id']: p['content'] for p in final_parents}
-        child_chunks = self._create_table_aware_child_chunks(final_parents)
+        child_chunks = await self._create_table_aware_child_chunks(final_parents)
+        print("\n\nCHUNKING COMPLETED")
         return child_chunks, parent_content_store
     
-    
-    def _clean_content(self, text: str) -> str:
+    async def _clean_content(self, text: str) -> str:
         text = re.sub(r'<!-- .*? -->\n?', '', text)
         text = re.sub(r'^\s*#{1,4}\s+', '', text, flags=re.MULTILINE)
         return text.strip()
 
-    def _create_initial_parent_chunks(self, markdown_content: str) -> List[Dict[str, Any]]:
+    async def _create_initial_parent_chunks(self, markdown_content: str) -> List[Dict[str, Any]]:
         parent_chunks = []
         chunks = re.split(r"\n(?=#{1,4}\s)", markdown_content)
         for i, chunk in enumerate(chunks):
@@ -39,11 +39,11 @@ class TableAwareChunker:
             parent_chunks.append({"parent_id": f"pt_{i}", "title": chunk.split('\n')[0].strip(), "raw_content": chunk})
         return parent_chunks
 
-    def _split_oversized_parents(self, parent_chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    async def _split_oversized_parents(self, parent_chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         final_parents = []
         sub_chunk_counter = 0
         for parent in parent_chunks:
-            cleaned_content = self._clean_content(parent['raw_content'])
+            cleaned_content = await self._clean_content(parent['raw_content'])
             if len(cleaned_content.encode('utf-8')) <= self.max_parent_size:
                 parent['content'] = cleaned_content
                 final_parents.append(parent)
@@ -64,11 +64,11 @@ class TableAwareChunker:
                     sub_chunk_counter += 1
         return final_parents
 
-    def _create_child_dict(self, child_id: int, content: str, parent_chunk: Dict[str, Any], content_type: str) -> Dict[str, Any]:
+    async def _create_child_dict(self, child_id: int, content: str, parent_chunk: Dict[str, Any], content_type: str) -> Dict[str, Any]:
         return {"child_id": f"{parent_chunk['parent_id']}_ch_{child_id}", "content": content.strip(), "metadata": {"parent_id": parent_chunk['parent_id'], "parent_title": parent_chunk['title'], "content_type": content_type}}
 
     
-    def _create_table_aware_child_chunks(self, parent_chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    async def _create_table_aware_child_chunks(self, parent_chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Creates smaller Child Chunks, now detecting and converting HTML tables.
         """
@@ -87,11 +87,11 @@ class TableAwareChunker:
                 is_html_table = block.startswith('<table>')
 
                 if is_html_table:
-                    block = self._convert_html_table_to_markdown(block)
+                    block = await self._convert_html_table_to_markdown(block)
                     current_chunk_type = 'table'
 
                 if len(current_chunk_content.encode('utf-8')) + len(block.encode('utf-8')) > self.child_chunk_size and current_chunk_content:
-                    all_child_chunks.append(self._create_child_dict(child_id_counter, current_chunk_content, parent, current_chunk_type))
+                    all_child_chunks.append(await self._create_child_dict(child_id_counter, current_chunk_content, parent, current_chunk_type))
                     child_id_counter += 1
                     current_chunk_content = ""
                     current_chunk_type = 'paragraph'
@@ -99,18 +99,18 @@ class TableAwareChunker:
                 current_chunk_content += block + "\n\n"
 
                 if is_html_table:
-                    all_child_chunks.append(self._create_child_dict(child_id_counter, current_chunk_content, parent, current_chunk_type))
+                    all_child_chunks.append(await self._create_child_dict(child_id_counter, current_chunk_content, parent, current_chunk_type))
                     child_id_counter += 1
                     current_chunk_content = ""
                     current_chunk_type = 'paragraph'
 
             if current_chunk_content.strip():
-                all_child_chunks.append(self._create_child_dict(child_id_counter, current_chunk_content, parent, current_chunk_type))
+                all_child_chunks.append(await self._create_child_dict(child_id_counter, current_chunk_content, parent, current_chunk_type))
                 child_id_counter += 1
         
         return all_child_chunks
     
-    def _convert_html_table_to_markdown(self, html_content: str) -> str:
+    async def _convert_html_table_to_markdown(self, html_content: str) -> str:
         """
         Parses an HTML table string and converts it into a clean Markdown table.
         """
