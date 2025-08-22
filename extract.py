@@ -2,7 +2,7 @@ import logging
 import requests
 import time
 from typing import Union, Dict
-from config import get_settings
+from config.config import get_settings
 from typing_extensions import List
 import asyncio
 import aiohttp # Import aiohttp
@@ -145,7 +145,7 @@ class DocumentIntelligenceService:
                     response.raise_for_status()
                     data = await response.json()
 
-                    if data.get("status") in ["succeeded", "failed"]:
+                    if data.get("status") == "succeeded":
                         return [True, data]
                     else:
                         # If status is running or other, treat as not present for simplicity

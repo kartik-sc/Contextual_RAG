@@ -1,7 +1,7 @@
 # Small Test:- In the reason query function I have specifically specified response format
 #              but not in search_query generating function
 
-from config import Settings
+from config.config import Settings
 from chunker import TableAwareChunker
 from state import ReasoningQueryPlan, SearchQueryPlan, InputState, OutputState, OverallState
 from extract import DocumentIntelligenceService
