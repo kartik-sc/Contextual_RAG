@@ -94,7 +94,7 @@ class DocumentIntelligenceService:
         url = f"{self.endpoint}/documentintelligence/documentModels/{model_id}/analyzeResults/{result_id}?api-version={self.api_version}&outputContentFormat=markdown"
         headers = {"Ocp-Apim-Subscription-Key": self.key}
 
-        with open("result_id.txt", "w") as file:
+        with open("config/result_id.txt", "w") as file:
             file.write(result_id)
 
         async with aiohttp.ClientSession() as session:
@@ -125,7 +125,7 @@ class DocumentIntelligenceService:
         """
         
         try:
-            with open("result_id.txt", "r") as file:
+            with open("config/result_id.txt", "r") as file:
                 old_result_id = file.readline().strip()
         except FileNotFoundError:
             return [False, None]

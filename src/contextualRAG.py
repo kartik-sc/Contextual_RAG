@@ -2,10 +2,10 @@
 #              but not in search_query generating function
 
 from config.config import Settings
-from chunker import TableAwareChunker
-from state import ReasoningQueryPlan, SearchQueryPlan, InputState, OutputState, OverallState
-from extract import DocumentIntelligenceService
-from prompts import SEARCH_QUERY_PROMPT, PLANNER_PROMPT, FEW_SHOT_EXAMPLES, GENERATOR_PROMPT
+from src.chunker import TableAwareChunker
+from src.state import ReasoningQueryPlan, SearchQueryPlan, InputState, OutputState, OverallState
+from src.extract import DocumentIntelligenceService
+from prompts.prompts import SEARCH_QUERY_PROMPT, PLANNER_PROMPT, FEW_SHOT_EXAMPLES, GENERATOR_PROMPT
 
 from dotenv import load_dotenv
 from typing import List,Dict,Any,Union

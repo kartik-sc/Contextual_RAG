@@ -1,9 +1,11 @@
 /__pycache__/
-/voyageai-env
+src/__pycache__/
+prompts/__pycache__/
+config/__pycache__/
+/voyageai-env/
 .env
 /.rag_store
 /archives
-result_id.txt
+/config/result_id.txt
 to-be-merged
-test_extract.py
-output.md
+.gitignore

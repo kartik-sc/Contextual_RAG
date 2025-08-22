@@ -10,9 +10,9 @@ from typing import TypedDict
 from dotenv import load_dotenv
 import asyncio
 
-from chunker import TableAwareChunker
-from contextualRAG import ContextualizedRAG
-from state import InputState, OutputState, OverallState
+from src.chunker import TableAwareChunker
+from src.contextualRAG import ContextualizedRAG
+from src.state import InputState, OutputState, OverallState
 
 load_dotenv()
 class UserInteraction:
@@ -80,7 +80,9 @@ class UserInteraction:
             await self.graph.aupdate_state(config, {"data_loaded": True, "error": [False, ""]})
 
         final_result = await self.graph.ainvoke(None, config=config)
-        print(final_result["final_response"])
+
+        with open("output\output.md", "w") as file:
+            file.write(final_result["final_response"])
 
     async def wrapper(self):
         """
@@ -104,4 +106,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
