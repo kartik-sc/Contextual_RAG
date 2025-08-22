@@ -18,6 +18,7 @@ from langchain.output_parsers import PydanticOutputParser
 from langsmith.wrappers import wrap_openai
 from langsmith import traceable
 import asyncio
+import time
 import aiohttp
 
 load_dotenv()
@@ -34,6 +35,10 @@ class ContextualizedRAG:
         ))
 
         self.cohere_client = cohere.Client(
+            api_key=settings.cohere.api_key,
+        )
+
+        self.async_cohere_client = cohere.AsyncClient(
             api_key=settings.cohere.api_key,
         )
 
@@ -57,22 +62,22 @@ class ContextualizedRAG:
         self.child_chunks = []
         self.parent_chunks = []
 
-    def _extract_content(self, pdf_blob_url):
+    async def _extract_content(self, pdf_blob_url):
         """
         Uses Microsoft Document Intelligence to retrieve information in markdown format.
         Chunks the retrieved context into parent chunk and it's child chunk
         """
 
-        analysis_result = self.doc_intel_client.analyze(pdf_blob_url, True)
+        analysis_result = await self.doc_intel_client.analyze(pdf_blob_url, True)
         markdown_content = analysis_result["analyzeResult"]["content"]
 
-        child_chunks, parent_chunks = self.chunker_class.process_document(markdown_content) 
+        child_chunks, parent_chunks = await self.chunker_class.process_document(markdown_content) 
         self.child_chunks = child_chunks
         self.parent_chunks = parent_chunks
 
         return parent_chunks, child_chunks
     
-    def _create_and_store_embeddings(self, processed_docs: List[Dict[str, Any]]):
+    async def _create_and_store_embeddings(self, processed_docs: List[Dict[str, Any]]):
         """
         Generates embeddings for the summaries using Cohere and stores them in ChromaDB.
         """
@@ -81,14 +86,14 @@ class ContextualizedRAG:
         content_to_embed = [ele['content'] for ele in processed_docs]
 
         try:
-            resp = self.cohere_client.embed(
+            resp = await self.async_cohere_client.embed(
                 model="embed-english-v3.0",
                 input_type="search_document",
                 texts=content_to_embed,
                 embedding_types=["float"]
             )
         except Exception as e:
-            resp = self.cohere_client.embed(
+            resp = await self.async_cohere_client.embed(
                 model="embed-multilingual-v3.0",
                 input_type="search_document",
                 texts=content_to_embed,
@@ -107,7 +112,7 @@ class ContextualizedRAG:
         logging.info("Storage complete.")
 
     @traceable
-    def data_ingestion(self, state:InputState):
+    async def data_ingestion(self, state:InputState):
         """
         This function completes the data ingestion into the vector database
         """
@@ -115,12 +120,14 @@ class ContextualizedRAG:
         pdf_blob_url = state.pdf_blob_url
 
         try:
-            _, processed_docs = self._extract_content(pdf_blob_url=pdf_blob_url)
-            self._create_and_store_embeddings(processed_docs)
-            return {"pdf_blob_url" : state.pdf_blob_url}
+            _, processed_docs = await self._extract_content(pdf_blob_url=pdf_blob_url)
+            print("\n\nPROCESSED DOCS GENERATED \n\n")
+            await self._create_and_store_embeddings(processed_docs)
+            return {"pdf_blob_url" : state.pdf_blob_url, "data_loaded" : True, "error" : [False, ""]}
 
         except Exception as e:
-            print(f"[ERROR]: {e}")
+            print(f"[ERROR in DI]: {e}")
+            return {"pdf_blob_url" : state.pdf_blob_url, "data_loaded" : False, "error" : [True, str(e)]}
 
     @traceable
     def get_parse_user_query(self, state:InputState):
@@ -235,6 +242,26 @@ class ContextualizedRAG:
         except Exception as e:
             print("Planning failed")
 
+    def _wait_for_data(self, state: OverallState):
+        """
+        Checks if the data ingestion has completed successfully before proceeding.
+        This node acts as a gate.
+        """
+        if state.get("error") and state["error"][0]:
+            return {"final_response": f"Could not continue due to a data ingestion error: {state['error'][1]}"}
+        
+        if state.get("data_loaded"):
+            return {}
+        
+        return {"final_response": "Data is not available yet. Please try again later."}
+        
+    def fallback_node(self, state: OverallState) -> dict:
+        """
+        Handles the graph when some error has occurred during data ingestion.
+        """
+        error_message = state.get("error", [True, "Unknown error"])[1]
+        return {"final_response": f"Could not continue the process due to the following error:\n{error_message}"}
+
     @traceable
     def _retrieve_and_grade(self, state):
         """
@@ -321,6 +348,7 @@ class ContextualizedRAG:
                 no_chunks += 1
             else:
                 break
+
             # if score > 0.75 and no_chunks < 5:
             #     final_results.append(content)
             #     no_chunks += 1

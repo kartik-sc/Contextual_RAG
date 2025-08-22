@@ -4,7 +4,8 @@ import time
 from typing import Union, Dict
 from config import get_settings
 from typing_extensions import List
-
+import asyncio
+import aiohttp # Import aiohttp
 
 class DocumentIntelligenceService:
     """
@@ -21,7 +22,7 @@ class DocumentIntelligenceService:
         self.endpoint = settings.document_intelligence.endpoint
         self.api_version = "2024-11-30" 
 
-    def analyze(
+    async def analyze(
         self,
         source: Union[str, bytes],
         is_url: bool = True,
@@ -38,15 +39,16 @@ class DocumentIntelligenceService:
         Raises:
             requests.HTTPError: If the API request fails.
         """
-        status, data = self._is_prev_analysis_present(model_id)
+        status, data = await self._is_prev_analysis_present(model_id)
 
         if not status:
-            result_id = self._submit_analysis(source, is_url, model_id)
-            return self._get_analysis_results(result_id, model_id)
+            result_id = await self._submit_analysis(source, is_url, model_id)
+            result = await self._get_analysis_results(result_id, model_id)
+            return result
         else:
             return data
 
-    def _submit_analysis(
+    async def _submit_analysis(
         self, source: Union[str, bytes], is_url: bool, model_id: str
     ) -> str:
         """
@@ -69,16 +71,15 @@ class DocumentIntelligenceService:
         data = {"urlSource": source} if is_url else {"base64Source": source}
 
         logging.info("Submitting document for analysis")
-        response = requests.post(url, headers=headers, json=data)
-        response.raise_for_status()
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=data) as response:
+                response.raise_for_status()
+                operation_location = response.headers.get("Operation-Location")
+                if not operation_location:
+                    raise ValueError("Operation-Location header is missing in the response.")
+                return operation_location.split("/")[-1].split("?")[0]
 
-        operation_location = response.headers.get("Operation-Location")
-        if not operation_location:
-            raise ValueError("Operation-Location header is missing in the response.")
-
-        return operation_location.split("/")[-1].split("?")[0]
-
-    def _get_analysis_results(self, result_id: str, model_id: str) -> Dict:
+    async def _get_analysis_results(self, result_id: str, model_id: str) -> Dict:
         """
         Retrieve the analysis results from Azure Document Intelligence.
         Args:
@@ -96,19 +97,20 @@ class DocumentIntelligenceService:
         with open("result_id.txt", "w") as file:
             file.write(result_id)
 
-        while True:
-            logging.info("Waiting for analysis to complete.")
-            time.sleep(2)
-            response = requests.get(url, headers=headers)
-            response.raise_for_status()
-            data = response.json()
+        async with aiohttp.ClientSession() as session:
+            while True:
+                logging.info("Waiting for analysis to complete.")
+                await asyncio.sleep(2)
+                async with session.get(url, headers=headers) as response:
+                    response.raise_for_status()
+                    data = await response.json()
 
-            if data.get("status") in ["succeeded", "failed"]:
-                return data
+                    if data.get("status") in ["succeeded", "failed"]:
+                        return data
             
     # NOTE:- THIS FUNCTION CANNOT BE USED IN REAL APPLICATION ONLY FOR TESTING PURPOSE
 
-    def _is_prev_analysis_present(self, model_id:str)-> Union[List,bool]:
+    async def _is_prev_analysis_present(self, model_id:str)-> Union[List,bool]:
         """
         Checks if the analysis of that document is already present in the azure document store
         Args:
@@ -122,26 +124,34 @@ class DocumentIntelligenceService:
                 APPLICABLE ONLY IF THE SOURCE URL IS THE SAME
         """
         
-        with open("result_id.txt", "r") as file:
-            old_result_id = file.readline()
+        try:
+            with open("result_id.txt", "r") as file:
+                old_result_id = file.readline().strip()
+        except FileNotFoundError:
+            return [False, None]
 
-        if old_result_id is None:
+        if not old_result_id:
             return [False, None]
 
         url = f"{self.endpoint}/documentintelligence/documentModels/{model_id}/analyzeResults/{old_result_id}?api-version={self.api_version}&outputContentFormat=markdown"
         headers = {"Ocp-Apim-Subscription-Key": self.key}
 
-        while True:
-            time.sleep(2)
+        async with aiohttp.ClientSession() as session:
             try:
-                response = requests.get(url=url, headers=headers)
-                response.raise_for_status()
-                data = response.json()
+                async with session.get(url=url, headers=headers) as response:
+                    if response.status == 404:
+                        print("Analysis not found on server.")
+                        return [False, None]
+                    response.raise_for_status()
+                    data = await response.json()
 
-                if data.get("status") in ["succeeded", "failed"]:
-                    return [True,data]
-            except Exception as e:
-                print("Analysis deleted from server")
+                    if data.get("status") in ["succeeded", "failed"]:
+                        return [True, data]
+                    else:
+                        # If status is running or other, treat as not present for simplicity
+                        return [False, None]
+            except aiohttp.ClientError as e:
+                print(f"Analysis deleted from server or network error: {e}")
                 return [False, None]
 
 
@@ -149,11 +159,12 @@ if __name__ == "__main__":
     # Example usage of the DocumentIntelligenceService
     pdf_blob_url = "https://hackrx.blob.core.windows.net/assets/policy.pdf?sv=2023-01-03&st=2025-07-04T09%3A11%3A24Z&se=2027-07-05T09%3A11%3A00Z&sr=b&sp=r&sig=N4a9OU0w0QXO6AOIBiu4bpl7AXvEZogeT%2FjUHNO7HzQ%3D"
 
-    client = DocumentIntelligenceService()
-    analysis_results = client.analyze(
-        source=pdf_blob_url
-    )
-    print(analysis_results.keys())
-    print(analysis_results["analyzeResult"].keys())
-    print(analysis_results["analyzeResult"]["content"])
-    print(analysis_results["analyzeResult"]["tables"])
+    async def run_analysis():
+        client = DocumentIntelligenceService()
+        analysis_results = await client.analyze(source=pdf_blob_url)
+        print(analysis_results.keys())
+        print(analysis_results["analyzeResult"].keys())
+        print(analysis_results["analyzeResult"]["content"])
+        print(analysis_results["analyzeResult"]["tables"])
+
+    asyncio.run(run_analysis())
